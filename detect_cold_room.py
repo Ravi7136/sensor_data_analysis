@@ -71,6 +71,18 @@ SEG_MAX_GAP_MIN = 30         # a location dwell may tolerate gaps up to this
 INFER_MIN_DWELL_MIN = 15     # a candidate room dwell must last at least this
 TEMP_GRADIENT_C = 3.0        # gradient needed to prefer the *coldest* dwell
 
+# --- cold-room temperature bands (from the facility spec) ---
+# A location counts as a COLD ROOM only if its stable temperature settles in one
+# of these bands. Room temperature (~15-25 C) is NOT a cold room. Detection stays
+# location/RSSI-primary; these bands VALIDATE the stay and LABEL its type
+# (frozen vs chilled), which also keeps it correct in winter.
+COLD_ROOM_TEMP_BANDS = [
+    ("Frozen", -25.0, -10.0),
+    ("Chilled", 2.0, 8.0),
+]
+BAND_TOLERANCE_C = 1.0       # widen band edges for sensor noise / quantisation
+REQUIRE_COLD_TEMP = True      # mark visits whose stable temp is not a cold band
+
 
 # --------------------------------------------------------------------------- #
 # LOADING / CLEANING
@@ -176,6 +188,24 @@ def _extend_segment(seg, r):
         seg["temps"].append(r["temp"])
 
 
+# --------------------------------------------------------------------------- #
+# TEMPERATURE BANDS
+# --------------------------------------------------------------------------- #
+def classify_temp_band(temp):
+    """Return the cold-room band label for a temperature, or 'Room/Other'."""
+    if temp is None:
+        return "Unknown"
+    for label, lo, hi in COLD_ROOM_TEMP_BANDS:
+        if lo - BAND_TOLERANCE_C <= temp <= hi + BAND_TOLERANCE_C:
+            return label
+    return "Room/Other"
+
+
+def is_cold_temp(temp):
+    """True if the temperature falls in any configured cold-room band."""
+    return classify_temp_band(temp) not in ("Room/Other", "Unknown")
+
+
 def infer_cold_room_waps(rows):
     """Return (set_of_wap_names, info_dict) for the inferred cold-room cluster."""
     segments = _segment_by_location(rows)
@@ -186,13 +216,19 @@ def infer_cold_room_waps(rows):
     def mean_temp(s):
         return statistics.mean(s["temps"]) if s["temps"] else float("nan")
 
-    longest = max(dwells, key=lambda s: _minutes(s["end"], s["start"]))
-    temps = [mean_temp(s) for s in dwells if s["temps"]]
+    # A genuine cold room settles in a cold band; if any cold-band dwell exists,
+    # drop room-temperature dwells from the candidates (avoids picking a
+    # warm storage/staging area as the cold room).
+    cold_dwells = [s for s in dwells if s["temps"] and is_cold_temp(mean_temp(s))]
+    candidates = cold_dwells if cold_dwells else dwells
+
+    longest = max(candidates, key=lambda s: _minutes(s["end"], s["start"]))
+    temps = [mean_temp(s) for s in candidates if s["temps"]]
     gradient = (max(temps) - min(temps)) if len(temps) >= 2 else 0.0
 
     if gradient >= TEMP_GRADIENT_C:
         # Clear temperature gradient (e.g. summer): the coldest dwell is the room.
-        chosen = min((s for s in dwells if s["temps"]), key=mean_temp)
+        chosen = min((s for s in candidates if s["temps"]), key=mean_temp)
         reason = f"coldest dwell (temp gradient {gradient:.1f} C across dwells)"
     else:
         # Small/no gradient (e.g. winter): fall back to the dominant dwell.
@@ -202,6 +238,7 @@ def infer_cold_room_waps(rows):
     info = {
         "reason": reason,
         "mean_temp": mean_temp(chosen),
+        "band": classify_temp_band(mean_temp(chosen)),
         "duration_min": _minutes(chosen["end"], chosen["start"]),
         "n_dwells": len(dwells),
     }
@@ -269,6 +306,10 @@ def detect_visits(rows):
         if _minutes(rows[exit_i]["dt"], rows[entry_i]["dt"]) < MIN_DWELL_MIN:
             continue
         temps = [rows[k]["temp"] for k in range(entry_i, exit_i + 1) if rows[k]["temp"] is not None]
+        # Stable temperature = median (robust to the short cool-down transient
+        # right after entry). Used only to VALIDATE and LABEL the stay.
+        stable_temp = statistics.median(temps) if temps else None
+        band = classify_temp_band(stable_temp)
         visits.append({
             "entry": rows[entry_i]["dt"],
             "exit": rows[exit_i]["dt"],
@@ -276,6 +317,9 @@ def detect_visits(rows):
             "duration_min": _minutes(rows[exit_i]["dt"], rows[entry_i]["dt"]),
             "mean_temp": statistics.mean(temps) if temps else None,
             "min_temp": min(temps) if temps else None,
+            "stable_temp": stable_temp,
+            "temp_band": band,
+            "is_cold_room": is_cold_temp(stable_temp) if REQUIRE_COLD_TEMP else True,
             "n_readings": exit_i - entry_i + 1,
         })
     return visits
@@ -296,7 +340,7 @@ def report(visits, cold_waps, info):
     print(f"Cold-room WAP cluster : {sorted(cold_waps)}")
     if info:
         print(f"  inferred by         : {info['reason']}")
-        print(f"  dwell mean temp     : {info['mean_temp']:.2f} C over "
+        print(f"  dwell mean temp     : {info['mean_temp']:.2f} C ({info['band']}) over "
               f"{_fmt_duration(info['duration_min'])} ({info['n_dwells']} dwell(s) seen)")
     print("-" * 78)
     if not visits:
@@ -308,8 +352,11 @@ def report(visits, cold_waps, info):
         print(f"  ENTRY    : {v['entry'].strftime(TIME_FMT)}")
         print(f"  EXIT     : {exit_str}")
         print(f"  DURATION : {_fmt_duration(v['duration_min'])}")
-        temp_txt = "n/a" if v["mean_temp"] is None else f"mean {v['mean_temp']:.2f} C, min {v['min_temp']:.2f} C"
+        temp_txt = "n/a" if v["mean_temp"] is None else (
+            f"stable {v['stable_temp']:.1f} C (mean {v['mean_temp']:.1f}, min {v['min_temp']:.1f})")
         print(f"  TEMP     : {temp_txt}   ({v['n_readings']} readings)")
+        cold_flag = "YES" if v["is_cold_room"] else "NO (room/other temp - not a cold room)"
+        print(f"  TYPE     : {v['temp_band']}    COLD ROOM: {cold_flag}")
         print("-" * 78)
 
 
@@ -317,12 +364,15 @@ def save_events(visits, path):
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["VISIT", "ENTRY_TIME", "EXIT_TIME", "ONGOING",
-                    "DURATION_MIN", "MEAN_TEMP_C", "MIN_TEMP_C", "N_READINGS"])
+                    "DURATION_MIN", "COLD_ROOM", "TEMP_BAND", "STABLE_TEMP_C",
+                    "MEAN_TEMP_C", "MIN_TEMP_C", "N_READINGS"])
         for i, v in enumerate(visits, 1):
             w.writerow([
                 i, v["entry"].strftime(TIME_FMT),
                 "" if v["ongoing"] else v["exit"].strftime(TIME_FMT),
                 v["ongoing"], round(v["duration_min"], 1),
+                "Yes" if v["is_cold_room"] else "No", v["temp_band"],
+                "" if v["stable_temp"] is None else round(v["stable_temp"], 2),
                 "" if v["mean_temp"] is None else round(v["mean_temp"], 2),
                 "" if v["min_temp"] is None else round(v["min_temp"], 2),
                 v["n_readings"],
