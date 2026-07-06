@@ -6,7 +6,12 @@ The output CSV mirrors the real device-export schema (one row per
 timestamp, already resolved by the server to the closest WAP), i.e. columns:
 
     EVENTTIME, HARDWARENAME, IDNODESERIALNUMBER, IDNODECHIPTEMPARATURE,
-    LATITUDE, LONGITUDE, RSSI1, RSSI2, RSSI3, RSSI4, RSSI5
+    LATITUDE, LONGITUDE, RSSI1, RSSI2, RSSI3, RSSI4, RSSI5,
+    IDNODELATITUDE, IDNODELONGITUDE
+
+LATITUDE/LONGITUDE are the closest WAP's coordinates (as in the real export).
+IDNODELATITUDE/IDNODELONGITUDE are the package device's own position, which in
+the real system comes from your internal RSSI-trilateration logic; simulated here.
 
 Physical model (learned from the sample sheets seq-1 .. seq-11):
   * Package starts at ambient (~23.5 C) and is carried through the station
@@ -64,6 +69,13 @@ TRANSIT_WAPS = [
     ("XX-12C-ap09", 35.067846, -89.97634),
     ("XX-10B-ap05", 35.068087, -89.976599),
 ]
+
+# IDNODE (package device) position - from RSSI-trilateration in the real system;
+# simulated here: carried from the station entrance to the cold room, then parked.
+ENTRY_POINT = (35.06785, -89.97630)            # approx entrance / outer area
+TRILAT_NOISE_M = 3.5                            # trilateration position error (m)
+_COLD_LAT = sum(w[1] for w in COLD_ROOM_WAPS) / len(COLD_ROOM_WAPS)
+_COLD_LON = sum(w[2] for w in COLD_ROOM_WAPS) / len(COLD_ROOM_WAPS)
 
 OUTPUT_CSV = "synthetic_cold_room_data.csv"
 
@@ -136,6 +148,34 @@ def make_rssi_values(ts):
     return values
 
 
+def _offset_metres(lat, lon, east_m, north_m):
+    """Shift a lat/lon by the given east/north offset in metres."""
+    dlat = north_m / 111111.0
+    dlon = east_m / (111111.0 * math.cos(math.radians(lat)))
+    return lat + dlat, lon + dlon
+
+
+def idnode_position_at(ts):
+    """Return the package device's (lat, lon) trilaterated position for a timestamp.
+
+    Transit phase: linearly carried from ENTRY_POINT to the cold-room centroid.
+    After entry: parked at the cold-room centroid. Small Gaussian trilateration
+    noise is added to both (it is derived from the in-room WAPs).
+    """
+    if ts < COOLDOWN_START:
+        span = (COOLDOWN_START - START_TIME).total_seconds()
+        frac = (ts - START_TIME).total_seconds() / span if span > 0 else 1.0
+        frac = min(max(frac, 0.0), 1.0)
+        lat = ENTRY_POINT[0] + (_COLD_LAT - ENTRY_POINT[0]) * frac
+        lon = ENTRY_POINT[1] + (_COLD_LON - ENTRY_POINT[1]) * frac
+    else:
+        lat, lon = _COLD_LAT, _COLD_LON
+    lat, lon = _offset_metres(lat, lon,
+                              random.gauss(0, TRILAT_NOISE_M),
+                              random.gauss(0, TRILAT_NOISE_M))
+    return round(lat, 6), round(lon, 6)
+
+
 # --------------------------------------------------------------------------- #
 # MAIN
 # --------------------------------------------------------------------------- #
@@ -148,6 +188,7 @@ def main():
         name, lat, lon = pick_wap(ts)
         temp = temperature_at(ts)
         rssi = make_rssi_values(ts)
+        idnode_lat, idnode_lon = idnode_position_at(ts)
         rows.append([
             ts.strftime(TIME_FMT),
             name,
@@ -156,12 +197,15 @@ def main():
             lat,
             lon,
             *rssi,
+            idnode_lat,
+            idnode_lon,
         ])
         ts += timedelta(minutes=random.choices(INTERVAL_CHOICES, INTERVAL_WEIGHTS)[0])
 
     header = [
         "EVENTTIME", "HARDWARENAME", "IDNODESERIALNUMBER", "IDNODECHIPTEMPARATURE",
         "LATITUDE", "LONGITUDE", "RSSI1", "RSSI2", "RSSI3", "RSSI4", "RSSI5",
+        "IDNODELATITUDE", "IDNODELONGITUDE",
     ]
     with open(OUTPUT_CSV, "w", newline="") as f:
         writer = csv.writer(f)
