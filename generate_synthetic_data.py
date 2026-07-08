@@ -6,10 +6,14 @@ The output CSV mirrors the real device-export schema (one row per
 timestamp, already resolved by the server to the closest WAP), i.e. columns:
 
     EVENTTIME, HARDWARENAME, IDNODESERIALNUMBER, IDNODECHIPTEMPARATURE,
-    LATITUDE, LONGITUDE, RSSI1, RSSI2, RSSI3, RSSI4, RSSI5,
+    LATITUDE, LONGITUDE,
+    txPower1..txPower5, RSSI1..RSSI5,
     IDNODELATITUDE, IDNODELONGITUDE
 
 LATITUDE/LONGITUDE are the closest WAP's coordinates (as in the real export).
+txPower1..5 are the 5 transmit-power levels (dBm) the package advertises at each
+minute (shuffled order); RSSI1..5 are the received signal for the matching
+packet, i.e. rssiN pairs with txPowerN (rssi = tx_power - path_loss + noise).
 IDNODELATITUDE/IDNODELONGITUDE are the package device's own position, which in
 the real system comes from your internal RSSI-trilateration logic; simulated here.
 
@@ -70,6 +74,9 @@ TRANSIT_WAPS = [
     ("XX-10B-ap05", 35.068087, -89.976599),
 ]
 
+# TX power levels (dBm) the package advertises at, every minute (shuffled order).
+TX_POWERS = [0, 4, -4, -8, -12]
+
 # IDNODE (package device) position - from RSSI-trilateration in the real system;
 # simulated here: carried from the station entrance to the cold room, then parked.
 ENTRY_POINT = (35.06785, -89.97630)            # approx entrance / outer area
@@ -117,35 +124,49 @@ def pick_wap(ts):
     return random.choice(COLD_ROOM_WAPS)
 
 
-def make_rssi_values(ts):
-    """Generate the 5 per-minute RSSI hearings for a row.
+def make_signal_values(ts):
+    """One minute of advertising at 5 transmit-power levels.
 
-    Returns a list of 5 items; each is an int (dBm), 0, or '' (blank),
-    mirroring the sparse pattern in the real export. RSSI1 is always present.
+    The device advertises each minute at the 5 TX powers {+4, 0, -4, -8, -12}
+    dBm (in a shuffled order, as in the real export). For each packet the WAP
+    records an RSSI that follows the radio model:
+
+        rssi = tx_power - path_loss + noise
+
+    The path loss is (roughly) constant within the minute because the package
+    is at one position, so a higher TX power yields a stronger (less negative)
+    RSSI. Occasionally a weaker packet is missed (0) or blank ('').
+
+    Returns (txpowers, rssis): two length-5 lists, aligned index-by-index, so
+    txPowerN corresponds to rssiN.
     """
     inside = ts >= COOLDOWN_START
     if inside:
-        strong_lo, strong_hi = -80, -56   # closest cold-room WAP -> strong
-        other_lo, other_hi = -95, -60
-        p_blank, p_zero = 0.18, 0.08
+        pl_mean, pl_sd = 72.0, 4.0     # near the cold-room WAPs -> lower loss
+        p_blank, p_zero = 0.10, 0.06
     else:
-        strong_lo, strong_hi = -90, -66   # transit -> generally weaker
-        other_lo, other_hi = -96, -70
-        p_blank, p_zero = 0.24, 0.10
+        pl_mean, pl_sd = 82.0, 5.0     # in transit -> farther / weaker
+        p_blank, p_zero = 0.18, 0.10
+    path_loss = random.gauss(pl_mean, pl_sd)   # fixed position within the minute
 
-    values = []
-    for i in range(5):
-        if i == 0:
-            values.append(random.randint(strong_lo, strong_hi))
-            continue
-        r = random.random()
-        if r < p_blank:
-            values.append("")
-        elif r < p_blank + p_zero:
-            values.append(0)
-        else:
-            values.append(random.randint(other_lo, other_hi))
-    return values
+    txpowers = TX_POWERS[:]
+    random.shuffle(txpowers)
+    strongest = max(txpowers)
+
+    rssis = []
+    for tx in txpowers:
+        # the strongest-power packet is always heard (keeps a usable reading)
+        if tx != strongest:
+            r = random.random()
+            if r < p_blank:
+                rssis.append("")
+                continue
+            if r < p_blank + p_zero:
+                rssis.append(0)
+                continue
+        rssi = tx - path_loss + random.gauss(0, 2.0)
+        rssis.append(int(round(max(-98.0, min(-50.0, rssi)))))
+    return txpowers, rssis
 
 
 def _offset_metres(lat, lon, east_m, north_m):
@@ -187,7 +208,7 @@ def main():
     while ts <= END_TIME:
         name, lat, lon = pick_wap(ts)
         temp = temperature_at(ts)
-        rssi = make_rssi_values(ts)
+        txpowers, rssi = make_signal_values(ts)
         idnode_lat, idnode_lon = idnode_position_at(ts)
         rows.append([
             ts.strftime(TIME_FMT),
@@ -196,6 +217,7 @@ def main():
             temp,
             lat,
             lon,
+            *txpowers,
             *rssi,
             idnode_lat,
             idnode_lon,
@@ -204,7 +226,9 @@ def main():
 
     header = [
         "EVENTTIME", "HARDWARENAME", "IDNODESERIALNUMBER", "IDNODECHIPTEMPARATURE",
-        "LATITUDE", "LONGITUDE", "RSSI1", "RSSI2", "RSSI3", "RSSI4", "RSSI5",
+        "LATITUDE", "LONGITUDE",
+        "txPower1", "txPower2", "txPower3", "txPower4", "txPower5",
+        "RSSI1", "RSSI2", "RSSI3", "RSSI4", "RSSI5",
         "IDNODELATITUDE", "IDNODELONGITUDE",
     ]
     with open(OUTPUT_CSV, "w", newline="") as f:
